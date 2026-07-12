@@ -15,108 +15,72 @@ jobs:
   fetch-geometry:
     runs-on: ubuntu-latest
     steps:
-      - name: Search Printables and fetch relevant public files
+      - name: Search public 11-inch M4/M5 body references
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p geometry/printables/files
+          mkdir -p geometry/files
           python3 - <<'PY'
           import json, pathlib, re, time, urllib.request
-
-          ROOT=pathlib.Path('geometry/printables')
+          ROOT=pathlib.Path('geometry')
           API='https://api.printables.com/graphql/'
           UA='Mozilla/5.0 (compatible; iPadCaseCADResearch/1.0)'
           searches=[
-            'iPad Pro 11 M4',
-            'iPad Pro 11 2024 case',
-            'iPad Pro M4 Magic Keyboard bumper',
-            'iPad Pro M4 case',
-            'Apple Pencil Pro',
-            'iPad pencil holder Magic Keyboard',
+            'iPad Pro 11 M4 dummy','iPad Pro 11 2024 model','iPad Pro M4 mockup',
+            'iPad Pro 11 reference','iPad Pro 11 template','iPad Pro 11 M4 mount',
+            'iPad Pro 11 M4 enclosure','iPad Pro 11 M4 bumper','iPad Pro 11 M5'
           ]
-
-          def gql(query, variables=None, operation=None):
-            payload={'query':query}
-            if variables is not None: payload['variables']=variables
-            if operation: payload['operationName']=operation
-            req=urllib.request.Request(API,data=json.dumps(payload).encode(),headers={'User-Agent':UA,'Content-Type':'application/json'})
-            with urllib.request.urlopen(req,timeout=60) as r:
-              data=json.loads(r.read())
-            if data.get('errors'):
-              raise RuntimeError(data['errors'])
+          def gql(query,variables=None,operation=None):
+            p={'query':query}
+            if variables is not None:p['variables']=variables
+            if operation:p['operationName']=operation
+            req=urllib.request.Request(API,data=json.dumps(p).encode(),headers={'User-Agent':UA,'Content-Type':'application/json'})
+            with urllib.request.urlopen(req,timeout=60) as r:data=json.loads(r.read())
+            if data.get('errors'):raise RuntimeError(data['errors'])
             return data['data']
-
-          search_query='''query SearchModels($query:String!,$limit:Int,$ordering:SearchChoicesEnum){result:searchPrints2(query:$query,printType:print,limit:$limit,ordering:$ordering){items{id name slug ratingAvg likesCount downloadCount datePublished user{publicUsername} image{filePath}}}}'''
-          file_query='''query ModelFiles($id:ID!){model:print(id:$id){id name filesType stls{id name folder fileSize filePreviewPath} otherFiles{id name folder fileSize filePreviewPath}}}'''
-          dl_query='''mutation GetDownloadLink($id:ID!,$modelId:ID!,$fileType:DownloadFileTypeEnum!,$source:DownloadSourceEnum!){getDownloadLink(id:$id,printId:$modelId,fileType:$fileType,source:$source){ok output{link count ttl} errors{field messages}}}'''
-
-          results={}
+          sq='''query SearchModels($query:String!,$limit:Int,$ordering:SearchChoicesEnum){result:searchPrints2(query:$query,printType:print,limit:$limit,ordering:$ordering){items{id name slug description downloadCount user{publicUsername} image{filePath}}}}'''
+          fq='''query ModelFiles($id:ID!){model:print(id:$id){id name description stls{id name folder fileSize filePreviewPath} otherFiles{id name folder fileSize filePreviewPath}}}'''
+          dq='''mutation GetDownloadLink($id:ID!,$modelId:ID!,$fileType:DownloadFileTypeEnum!,$source:DownloadSourceEnum!){getDownloadLink(id:$id,printId:$modelId,fileType:$fileType,source:$source){ok output{link} errors{field messages}}}'''
+          results={}; flat={}
           for term in searches:
-            data=gql(search_query,{'query':term,'limit':30,'ordering':'best_match'},'SearchModels')
-            items=data['result']['items']
+            items=gql(sq,{'query':term,'limit':50,'ordering':'best_match'},'SearchModels')['result']['items']
             results[term]=items
-            time.sleep(.3)
-
-          flat={str(x['id']):x for items in results.values() for x in items}
-          # Always include known relevant precedents.
-          for pid in ('404087','596346','95985'):
-            flat.setdefault(pid,{'id':pid,'name':'known-reference','slug':'','user':{}})
-
-          def score(item):
-            s=(item.get('name') or '').lower()
-            points=0
-            for token,w in [('ipad',10),('pro',5),('11',8),('m4',10),('2024',7),('magic keyboard',8),('bumper',10),('case',5),('pencil pro',8)]:
-              if token in s: points+=w
-            return points
-
-          catalog=[]
-          total=0
-          for pid,item in sorted(flat.items(),key=lambda kv:score(kv[1]),reverse=True):
-            try:
-              model=gql(file_query,{'id':pid},'ModelFiles')['model']
-            except Exception as e:
-              catalog.append({'id':pid,'search':item,'error':repr(e)})
-              continue
-            if not model: continue
-            entry={'id':pid,'search':item,'model':model,'score':score(item),'downloads':[]}
-            catalog.append(entry)
-            name=(model.get('name') or '').lower()
-            relevant=(pid in {'404087','596346','95985'} or ('ipad' in name and any(t in name for t in ('m4','2024','11','magic keyboard','bumper'))) or 'pencil pro' in name)
-            if not relevant: continue
+            for x in items:flat[str(x['id'])]=x
+            time.sleep(.2)
+          catalog=[]; total=0
+          for pid,item in flat.items():
+            model=gql(fq,{'id':pid},'ModelFiles')['model']
+            if not model:continue
+            text=((model.get('name') or '')+' '+(model.get('description') or '')).lower()
+            entry={'id':pid,'summary':item,'model':model,'downloads':[]};catalog.append(entry)
+            relevant=('ipad' in text and any(t in text for t in ('m4','m5','2024','2025')) and any(t in text for t in ('11','dummy','model','template','case','mount','enclosure','bumper')))
+            if not relevant:continue
             for bucket,ftype in [('stls','stl'),('otherFiles','other')]:
               for f in model.get(bucket) or []:
                 ext=pathlib.Path(f['name']).suffix.lower()
-                if ext not in {'.stl','.3mf','.step','.stp','.iges','.igs','.f3d','.obj','.scad'}: continue
-                size=f.get('fileSize') or 0
-                if size and size>30_000_000: continue
-                if total>150_000_000: break
-                try:
-                  d=gql(dl_query,{'id':f['id'],'modelId':pid,'fileType':ftype,'source':'model_detail'},'GetDownloadLink')['getDownloadLink']
-                  link=((d or {}).get('output') or {}).get('link')
-                  if not link: continue
-                  safe=re.sub(r'[^A-Za-z0-9_.-]+','_',f['name'])
-                  out=ROOT/'files'/f'{pid}__{safe}'
-                  req=urllib.request.Request(link,headers={'User-Agent':UA})
-                  with urllib.request.urlopen(req,timeout=180) as r: blob=r.read()
-                  out.write_bytes(blob); total+=len(blob)
-                  entry['downloads'].append({'file':f,'saved':str(out),'bytes':len(blob)})
-                except Exception as e:
-                  entry['downloads'].append({'file':f,'error':repr(e)})
-                time.sleep(.2)
-
-          report={'searches':results,'catalog':catalog,'downloaded_bytes':total}
-          (ROOT/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
-          print('models',len(catalog),'downloaded bytes',total)
+                if ext not in {'.stl','.3mf','.step','.stp','.iges','.igs','.f3d','.obj','.scad'}:continue
+                if (f.get('fileSize') or 0)>40_000_000 or total>200_000_000:continue
+                d=gql(dq,{'id':f['id'],'modelId':pid,'fileType':ftype,'source':'model_detail'},'GetDownloadLink')['getDownloadLink']
+                link=((d or {}).get('output') or {}).get('link')
+                if not link:continue
+                safe=re.sub(r'[^A-Za-z0-9_.-]+','_',f['name'])
+                out=ROOT/'files'/f'{pid}__{safe}'
+                req=urllib.request.Request(link,headers={'User-Agent':UA})
+                with urllib.request.urlopen(req,timeout=180) as r:blob=r.read()
+                out.write_bytes(blob);total+=len(blob)
+                entry['downloads'].append({'name':f['name'],'saved':str(out),'bytes':len(blob)})
+                time.sleep(.15)
+          (ROOT/'report.json').write_text(json.dumps({'searches':results,'catalog':catalog,'bytes':total},indent=2),encoding='utf-8')
+          print('results',len(flat),'models',len(catalog),'bytes',total)
           for e in catalog:
-            if e.get('downloads'):
-              print(e['id'],e['model']['name'],[(d.get('saved'),d.get('bytes'),d.get('error')) for d in e['downloads']])
+            if e['downloads']:print(e['id'],e['model']['name'],e['downloads'])
           PY
-          find geometry -maxdepth 4 -type f -printf '%p %s bytes\n' | sort
+          find geometry -maxdepth 3 -type f -printf '%p %s bytes\n' | sort
 
       - name: Upload geometry bundle
         uses: actions/upload-artifact@v4
         with:
-          name: ipad-public-cad-references
+          name: ipad-body-reference-search
           path: geometry/
           if-no-files-found: error
           retention-days: 1
