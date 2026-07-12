@@ -1,0 +1,116 @@
+name: Temporary iPad case geometry fetch
+
+on:
+  push:
+    branches:
+      - tmp-ipad-case-geometry-fetch-20260712
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-geometry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch official and public reference assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p geometry/pages geometry/discovered
+
+          curl -L --fail --retry 3 \
+            -A 'Mozilla/5.0' \
+            'https://www.apple.com/105/media/us/ipad-pro/2025/adee90db-c01e-430d-b726-fe64c0063f08/ar/ipad-pro-space-black.usdz' \
+            -o geometry/ipad-pro-m5-space-black-official.usdz
+
+          python3 - <<'PY'
+          import json, re, urllib.parse, urllib.request, pathlib, ssl
+
+          out = pathlib.Path('geometry')
+          pages = out / 'pages'
+          pages.mkdir(parents=True, exist_ok=True)
+          urls = {
+              'pencil': 'https://www.apple.com/shop/product/MX2D3AM/A/apple-pencil-pro',
+              'keyboard_white': 'https://www.apple.com/shop/product/MWR03LL/A/magic-keyboard-for-ipad-pro-11-inch-m5-us-english-white',
+              'ipad': 'https://www.apple.com/ipad-pro/',
+              'sketchfab': 'https://sketchfab.com/3d-models/ipad-pro-m4-2024-with-apple-pencil-pro-and-mkb-1a76ebc17fdf4abd85fa3a12686b0e67',
+              'sketchfab_api': 'https://api.sketchfab.com/v3/models/1a76ebc17fdf4abd85fa3a12686b0e67',
+              'sketchfab_download_api': 'https://api.sketchfab.com/v3/models/1a76ebc17fdf4abd85fa3a12686b0e67/download',
+          }
+          headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36'}
+          report = {'sources': urls, 'usdz_urls': [], 'asset_urls': [], 'errors': {}}
+
+          def fetch(url, name):
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=60, context=ssl.create_default_context()) as r:
+                      data = r.read()
+                      final = r.geturl()
+                      ctype = r.headers.get('Content-Type')
+                      status = getattr(r, 'status', None)
+                  (pages / name).write_bytes(data)
+                  return data, final, ctype, status
+              except Exception as e:
+                  report['errors'][name] = repr(e)
+                  return b'', url, None, None
+
+          fetched = {}
+          for name, url in urls.items():
+              data, final, ctype, status = fetch(url, name + ('.json' if 'api' in name else '.html'))
+              fetched[name] = (data, final, ctype, status)
+              report.setdefault('responses', {})[name] = {'final_url': final, 'content_type': ctype, 'status': status, 'bytes': len(data)}
+
+          patterns = [
+              rb'https?://[^"\'<>\\ ]+?\.usdz(?:\?[^"\'<>\\ ]*)?',
+              rb'https?://[^"\'<>\\ ]+?\.(?:glb|gltf|obj|fbx|stl|step|stp|zip)(?:\?[^"\'<>\\ ]*)?',
+              rb'[^"\'<>\\ ]+?\.usdz(?:\?[^"\'<>\\ ]*)?',
+          ]
+          discovered = set()
+          for name, (data, final, ctype, status) in fetched.items():
+              for pat in patterns:
+                  for m in re.findall(pat, data, flags=re.I):
+                      s = m.decode('utf-8', 'ignore').replace('\\/', '/')
+                      if s.startswith('//'):
+                          s = 'https:' + s
+                      elif not s.startswith('http'):
+                          s = urllib.parse.urljoin(final, s)
+                      discovered.add(s)
+
+          # Scan same-origin script files referenced by Apple product pages for hidden AR assets.
+          script_re = re.compile(rb'<script[^>]+src=["\']([^"\']+)["\']', re.I)
+          for page_name in ('pencil', 'keyboard_white', 'ipad'):
+              data, final, *_ = fetched[page_name]
+              for raw in script_re.findall(data):
+                  src = urllib.parse.urljoin(final, raw.decode('utf-8', 'ignore'))
+                  if not any(host in src for host in ('apple.com', 'cdn-apple.com')):
+                      continue
+                  safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', src)[-180:]
+                  sdata, sfinal, sctype, sstatus = fetch(src, f'script_{page_name}_{safe_name}.js')
+                  if len(sdata) > 20_000_000:
+                      continue
+                  for pat in patterns:
+                      for m in re.findall(pat, sdata, flags=re.I):
+                          s = m.decode('utf-8', 'ignore').replace('\\/', '/')
+                          if s.startswith('//'):
+                              s = 'https:' + s
+                          elif not s.startswith('http'):
+                              s = urllib.parse.urljoin(sfinal, s)
+                          discovered.add(s)
+
+          report['asset_urls'] = sorted(discovered)
+          report['usdz_urls'] = [u for u in report['asset_urls'] if '.usdz' in u.lower()]
+          (out / 'discovery-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print(json.dumps(report, indent=2))
+          PY
+
+          file geometry/ipad-pro-m5-space-black-official.usdz
+          sha256sum geometry/ipad-pro-m5-space-black-official.usdz > geometry/SHA256SUMS.txt
+          find geometry -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+
+      - name: Upload geometry bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipad-case-reference-geometry
+          path: geometry/
+          if-no-files-found: error
+          retention-days: 1
