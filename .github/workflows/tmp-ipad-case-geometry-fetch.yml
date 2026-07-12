@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - tmp-ipad-case-geometry-fetch-20260712
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -76,7 +79,6 @@ jobs:
                           s = urllib.parse.urljoin(final, s)
                       discovered.add(s)
 
-          # Scan same-origin script files referenced by Apple product pages for hidden AR assets.
           script_re = re.compile(rb'<script[^>]+src=["\']([^"\']+)["\']', re.I)
           for page_name in ('pencil', 'keyboard_white', 'ipad'):
               data, final, *_ = fetched[page_name]
